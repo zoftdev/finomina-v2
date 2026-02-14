@@ -1,5 +1,6 @@
 import os
 import json
+import functools
 
 import requests
 import pandas as pd
@@ -9,6 +10,22 @@ from bs4 import BeautifulSoup
 from finnomena_api.utils import load_yaml, remove_nonEng
 
 from finnomena_api.keys import keys
+
+# Configuration to lock untested features (default: locked)
+# Set LOCK_UNTESTED=true to unlock untested methods
+UNTESTED_LOCKED = os.environ.get('LOCK_UNTESTED', 'false').lower() != 'true'
+
+def lock_untested(func):
+    """Decorator to lock methods that haven't been tested."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if UNTESTED_LOCKED:
+            raise RuntimeError(
+                f"Method '{func.__name__}' is locked because it hasn't been tested. "
+                f"Set LOCK_UNTESTED=true to unlock."
+            )
+        return func(*args, **kwargs)
+    return wrapper
 
 class finnomenaAPI:
     def __init__(self, email=None, password=None):
@@ -24,6 +41,7 @@ class finnomenaAPI:
         self.session = requests.Session()
         self.is_login = self.check_login_status()
 
+    @lock_untested
     def login(self):
         """
         A function to login to finnomena account by the given email and password
@@ -123,7 +141,7 @@ class finnomenaAPI:
 
         Args:
             sec_name (str): the fund's code name (e.g. KT-WTAI-A, TMBCOF)
-        
+
         Returns:
             info (dict): dictionary containing the fund's information
 
@@ -151,29 +169,25 @@ class finnomenaAPI:
         info['security_name'] = sec_name_found
         info['morningstar_id'] = mstar_id
         info['feeder_fund'] = feeder_fund
-        # ----------------------------------------------------------------
-        payload = {'fund':mstar_id}
-        other_info = requests.get('https://www.finnomena.com/fn3/api/fund/nav/latest', params=payload).json()
-        info['nav_date'] = other_info['nav_date']
-        info['current_price'] = other_info['value']
-        info['total_amount'] = other_info['amount']
-        info['d_change'] = other_info['d_change']
-        # ----------------------------------------------------------------
 
-        fee_url = 'https://www.finnomena.com/fn3/api/fund/public/' + mstar_id + '/fee'
-        fees_list = requests.get(fee_url).json()['fees']
+        # Get fund data from public API
+        public_fund_url = f'https://www.finnomena.com/fn3/api/fund/public/{mstar_id}'
+        fund_data = requests.get(public_fund_url).json()
 
-        fees = {v:None for v in self.keys['fees_dict'].values()}
-        for i in fees_list:
-            if i['feetypedesc'] in self.keys['fees_dict']:
+        # Extract info from public API response
+        info['nav_date'] = fund_data.get('data_date')
+        info['current_price'] = None  # Not available in new API
+        info['total_amount'] = None  # Not available in new API
+        info['d_change'] = fund_data.get('unit_change_1d')
 
-                try:
-                    amount = float(i['actualvalue'])
-                except:
-                    amount = np.nan
-
-                fees[self.keys['fees_dict'][i['feetypedesc']]] = amount
-        # ----------------------------------------------------------------
+        # Extract fees from public API response
+        fees = {}
+        fees['purchase_fee'] = fund_data.get('real_front_end_fee') or fund_data.get('maximum_front_end_fee')
+        fees['redemption_fee'] = fund_data.get('real_back_end_fee') or fund_data.get('maximum_back_end_fee')
+        fees['management_fee'] = fund_data.get('real_management_fee') or fund_data.get('maximum_management_fee')
+        fees['total_expense_ratio'] = fund_data.get('net_expense_ratio')
+        fees['switchIn_fee'] = None  # Not available in new API
+        fees['switchOut_fee'] = None  # Not available in new API
 
         info = {**info, **fees}
 
@@ -187,39 +201,58 @@ class finnomenaAPI:
 
         Args:
             sec_name (str): the fund's code name (e.g. KT-WTAI-A, TMBCOF)
-            time_range (str, optional): time frame to get the fund's price. 
-                                        E.g. setting time_range = '1Y' will return the price of the fund since a year ago until today. 
+            time_range (str, optional): time frame to get the fund's price.
+                                        E.g. setting time_range = '1Y' will return the price of the fund since a year ago until today.
                                         If not given, it will return all of the available data (price since inception)
-        
+
         Returns:
-            price (pandas.Dataframe): a dataframe of fund's price in timeseries 
+            price (pandas.Dataframe): a dataframe of fund's price in timeseries
 
         """
         sec_name = str(sec_name)
         time_range = str(time_range)
-
-        info = self.get_fund_info(sec_name)
-        mstar_id = info['morningstar_id']
 
         # Validate time_range (available options are 1D, 7D, 1M, 3M, 6M, 1Y, 3Y, 5Y, 10Y and MAX)
         time_range_option = ['1D', '7D', '1M', '3M', '6M', '1Y', '3Y', '5Y', '10Y', 'MAX']
         if time_range not in time_range_option:
             raise ValueError('time_range is not valid. The options are ' + ', '.join(time_range_option))
 
-        payload = {'range':  time_range,
-                   'fund': mstar_id}
-        url = self.keys['url']['fund_timeseries_price']
-        temp_data = requests.get(url, params=payload).json()
+        # Map time_range to pythainav format
+        # pythainav uses: 1W, 1M, 3M, 6M, 1Y, MAX (doesn't support 1D, 7D, 3Y, 5Y, 10Y)
+        pythainav_range_map = {
+            '1D': '1W',   # Map 1D to 1W (closest available)
+            '7D': '1W',   # Map 7D to 1W
+            '1M': '1M',
+            '3M': '3M',
+            '6M': '6M',
+            '1Y': '1Y',
+            '3Y': 'MAX',  # Map 3Y to MAX
+            '5Y': 'MAX',  # Map 5Y to MAX
+            '10Y': 'MAX', # Map 10Y to MAX
+            'MAX': 'MAX'
+        }
+        pythainav_range = pythainav_range_map.get(time_range, time_range)
 
-        data = {'date':[], 'price':[]}
-        for i in temp_data:
-            data['date'].append(i['nav_date'])
-            data['price'].append(float(i['value']))
+        # Use pythainav to get historical NAV data
+        from pythainav.sources import Finnomena
+        source = Finnomena()
         
+        try:
+            nav_data = source.get_range(sec_name, pythainav_range)
+        except Exception as e:
+            raise ValueError(f"Cannot retrieve price data for fund '{sec_name}': {str(e)}")
+
+        # Convert to DataFrame
+        data = {'date': [], 'price': []}
+        for nav in nav_data:
+            data['date'].append(nav.updated.strftime('%Y-%m-%d'))
+            data['price'].append(float(nav.value))
+
         price = pd.DataFrame(data)
 
         return price
 
+    @lock_untested
     def get_account_status(self):
         """
         A function to get a current status of the given finnomena account. The 'status' are:
@@ -264,6 +297,7 @@ class finnomenaAPI:
         
         return result_dict
     
+    @lock_untested
     def get_port_status(self, port_name):
         """
         A function to get a current status of a portfolio under the given finnomena account. The 'status' are:
@@ -324,9 +358,10 @@ class finnomenaAPI:
                                                     'unit_cost':'total_unit'})
         return overall, historical_value, compositions
 
-    def get_order_history(self, port_name):  
+    @lock_untested
+    def get_order_history(self, port_name):
         """
-        A function to get the order history of a portfolio in the given account 
+        A function to get the order history of a portfolio in the given account
 
         **This function REQUIRES logging in.**
 

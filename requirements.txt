@@ -3,3 +3,4 @@ pyyaml
 requests
 BeautifulSoup4
 numpy
+pythainav
